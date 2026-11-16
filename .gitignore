@@ -1,0 +1,12 @@
+# 真实配置（含青龙密钥），不要提交
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 日志/临时文件
+*.log
+server.log
+.DS_Store
+Thumbs.db
