@@ -30,6 +30,12 @@ sh deploy.sh                  # 交互式填写青龙凭据，自动构建启动
 部署完成后手机浏览器访问 `http://R2S的IP:8787` 即可。
 
 > `deploy.sh` 会检查 docker、生成 `.env`、提示输入青龙 Client ID / Secret，然后 `docker compose up -d --build` 并打印访问地址。更新代码只要 `git pull && docker compose up -d --build`。
+>
+> 国内网络 `git clone` 慢或失败时，可改用压缩包（无需 git 环境）：
+> ```bash
+> curl -L https://codeload.github.com/Wangzhe997/jd-ck-helper/tar.gz/refs/heads/main -o jd-ck-helper.tgz
+> tar -xzf jd-ck-helper.tgz && cd jd-ck-helper-main && sh deploy.sh
+> ```
 
 ### 前置条件：青龙应用凭据
 
