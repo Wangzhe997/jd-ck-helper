@@ -15,6 +15,13 @@ services:
       - MODE=${MODE:-multi}
       - PORT=${PORT:-8787}
       - BIND_HOST=${BIND_HOST:-0.0.0.0}
-      # 访问密码（通过 ddnsto 等暴露到外网时务必设置强密码；留空=不启用认证，纯内网用）
+      # 登录保护：推荐直接在页面「安全设置」里设置用户名和密码，
+      # 凭据保存在下面的 data 卷里（auth.json），重建容器不丢、可在页面修改。
+      # 下面两项仅用于「首次启动自动导入初始凭据」，留空=不启用。
+      - ACCESS_USERNAME=${ACCESS_USERNAME:-admin}
       - ACCESS_PASSWORD=${ACCESS_PASSWORD:-}
+      - DATA_DIR=/data
       - TZ=${TZ:-Asia/Shanghai}
+    volumes:
+      # 登录凭据持久化目录（./data 内含 auth.json，已在 .gitignore 中排除）
+      - ./data:/data

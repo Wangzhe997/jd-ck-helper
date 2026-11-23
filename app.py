@@ -15,8 +15,11 @@ JD CK 助手 —— 配合青龙面板使用的京东 Cookie 一键提交工具
   MODE               multi=一账号一个变量(推荐)；merge=全部账号合并进一个变量(换行分隔)
   PORT               监听端口，默认 8787
   BIND_HOST          监听地址，默认 0.0.0.0（Docker 用），本地测试可设 127.0.0.1
-  ACCESS_PASSWORD    访问密码；留空=不启用认证（纯内网）。通过 ddnsto 等暴露到
-                     外网时务必设置强密码
+  ACCESS_USERNAME    可选，首次启动自动导入的初始用户名，默认 admin
+  ACCESS_PASSWORD    可选，首次启动自动导入的初始密码。留空=不启用认证（纯内网）。
+                     之后一律以页面「安全设置」保存的为准，改密码不会被环境变量覆盖
+  DATA_DIR           登录凭据持久化目录，默认脚本同目录的 data/；
+                     Docker 中由 compose 挂载为 /data 卷，重建容器不丢失
 """
 import base64
 import hashlib
@@ -28,6 +31,7 @@ import sys
 import threading
 import time
 import uuid
+from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib import request as urlreq
 from urllib.error import HTTPError, URLError
@@ -42,13 +46,23 @@ if MODE not in ("multi", "merge"):
     MODE = "multi"
 PORT = int(os.environ.get("PORT", "8787"))
 BIND_HOST = os.environ.get("BIND_HOST", "0.0.0.0").strip() or "0.0.0.0"
+
+ACCESS_USERNAME = os.environ.get("ACCESS_USERNAME", "").strip() or "admin"
 ACCESS_PASSWORD = os.environ.get("ACCESS_PASSWORD", "").strip()
-AUTH_ENABLED = bool(ACCESS_PASSWORD)
+DATA_DIR = (os.environ.get("DATA_DIR", "").strip()
+            or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+AUTH_FILE = os.path.join(DATA_DIR, "auth.json")
 
 # 登录会话：HMAC 签名 cookie，有效期 30 天
-AUTH_SECRET = hashlib.sha256(("jd-ck-helper:" + ACCESS_PASSWORD).encode("utf-8")).digest()
 AUTH_TTL = 30 * 86400
 AUTH_COOKIE = "jdck_auth"
+PBKDF2_ITER = 150000
+
+# 认证状态（内存镜像，持久化在 data/auth.json）
+#   {"enabled": bool, "username": str, "salt": hex, "hash": hex, "iter": int}
+AUTH_STATE = {"enabled": False, "username": "", "salt": "", "hash": "",
+              "iter": PBKDF2_ITER}
+AUTH_LOCK = threading.Lock()
 
 # 登录失败限速：ip -> [失败次数, 锁定截止时间戳]
 LOGIN_FAILS = {}
@@ -426,8 +440,104 @@ def push_to_ql(ck, pin, nickname):
 
 # ---------------------------------------------------------------- 访问认证
 
+def _derive(password, salt_hex, iterations):
+    """PBKDF2-HMAC-SHA256 -> hex"""
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                             bytes.fromhex(salt_hex), iterations)
+    return dk.hex()
+
+
+def _validate_username(username):
+    if not isinstance(username, str):
+        return "用户名格式错误"
+    u = username.strip()
+    if not (1 <= len(u) <= 32):
+        return "用户名需为 1-32 个字符"
+    if re.search(r"\s", u) or re.search(r"[\x00-\x1f\x7f]", u):
+        return "用户名不能包含空格或控制字符"
+    return ""
+
+
+def _validate_password(password):
+    if not isinstance(password, str) or not (8 <= len(password) <= 128):
+        return "密码长度需为 8-128 位"
+    return ""
+
+
+def _validate_cred(username, password):
+    return _validate_username(username) or _validate_password(password)
+
+
+def _auth_load():
+    """载入凭据：优先 data/auth.json；不存在则用 .env 的初始值自动迁移一次"""
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except OSError as e:
+        print("[jd-ck] ⚠️ 无法创建数据目录 %s: %s" % (DATA_DIR, e), flush=True)
+        return
+    if os.path.exists(AUTH_FILE):
+        try:
+            with open(AUTH_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict) and "enabled" in d:
+                AUTH_STATE.update({
+                    "enabled": bool(d.get("enabled")),
+                    "username": str(d.get("username") or ""),
+                    "salt": str(d.get("salt") or ""),
+                    "hash": str(d.get("hash") or ""),
+                    "iter": int(d.get("iter") or PBKDF2_ITER),
+                })
+                return
+        except (ValueError, OSError, TypeError):
+            print("[jd-ck] ⚠️ auth.json 解析失败，回退到环境变量配置", flush=True)
+    # 兼容旧版：把 .env 里的 ACCESS_PASSWORD 作为初始凭据导入（仅一次）
+    if ACCESS_PASSWORD:
+        salt = os.urandom(16).hex()
+        AUTH_STATE.update({
+            "enabled": True,
+            "username": ACCESS_USERNAME,
+            "salt": salt,
+            "hash": _derive(ACCESS_PASSWORD, salt, PBKDF2_ITER),
+            "iter": PBKDF2_ITER,
+        })
+        try:
+            _auth_save()
+            print("[jd-ck] 已把 .env 中的 ACCESS_PASSWORD 导入 %s" % AUTH_FILE,
+                  flush=True)
+        except OSError as e:
+            print("[jd-ck] ⚠️ 写入 %s 失败（本次仍生效，重启需重新导入）: %s"
+                  % (AUTH_FILE, e), flush=True)
+
+
+def _auth_save():
+    """原子写入，避免意外断电写坏；Linux 下权限 0600"""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    payload = {
+        "enabled": AUTH_STATE["enabled"],
+        "username": AUTH_STATE["username"],
+        "salt": AUTH_STATE["salt"],
+        "hash": AUTH_STATE["hash"],
+        "iter": AUTH_STATE["iter"],
+        "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    tmp = AUTH_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, AUTH_FILE)
+
+
+def _auth_secret():
+    """签名密钥随用户名/密码哈希变化 -> 改密码或用户名即让所有旧会话失效"""
+    raw = "jd-ck-helper:%s:%s" % (AUTH_STATE["username"], AUTH_STATE["hash"])
+    return hashlib.sha256(raw.encode("utf-8")).digest()
+
+
 def _auth_sign(exp):
-    return hmac.new(AUTH_SECRET, str(exp).encode("utf-8"),
+    return hmac.new(_auth_secret(), str(exp).encode("utf-8"),
                     hashlib.sha256).hexdigest()[:32]
 
 
@@ -436,8 +546,13 @@ def _auth_token():
     return "%d.%s" % (exp, _auth_sign(exp))
 
 
+def _session_cookie():
+    return ("%s=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Lax"
+            % (AUTH_COOKIE, _auth_token(), AUTH_TTL))
+
+
 def _auth_ok(cookie_header):
-    if not AUTH_ENABLED:
+    if not AUTH_STATE["enabled"]:
         return True
     if not cookie_header:
         return False
@@ -452,6 +567,30 @@ def _auth_ok(cookie_header):
             return False
         return hmac.compare_digest(sig, _auth_sign(exp))
     return False
+
+
+def _check_pw(password):
+    """校验密码（用户名需另行比较）"""
+    if not AUTH_STATE["enabled"] or not isinstance(password, str):
+        return False
+    try:
+        calc = _derive(password, AUTH_STATE["salt"], AUTH_STATE["iter"])
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(calc, AUTH_STATE["hash"])
+
+
+def _set_cred(username, password):
+    """新建/重置凭据（调用方需持 AUTH_LOCK）"""
+    salt = os.urandom(16).hex()
+    AUTH_STATE.update({
+        "enabled": True,
+        "username": username.strip(),
+        "salt": salt,
+        "hash": _derive(password, salt, PBKDF2_ITER),
+        "iter": PBKDF2_ITER,
+    })
+    _auth_save()
 
 
 def _login_allowed(ip):
@@ -490,40 +629,56 @@ LOGIN_PAGE = """<!doctype html>
   p{margin:0 0 18px;font-size:13px;color:#7a8496}
   input{width:100%;box-sizing:border-box;border:1px solid #e7ebf1;border-radius:10px;
         padding:12px;font-size:16px;background:#fbfcfe;color:#1c2330}
+  input+input{margin-top:10px}
   input:focus{outline:2px solid #ffc9c5;border-color:#e1251b}
   button{margin-top:12px;width:100%;border:0;border-radius:10px;padding:12px;
          font-size:15px;font-weight:600;background:#e1251b;color:#fff;cursor:pointer}
   button:active{transform:scale(.98)}
-  .err{margin-top:10px;font-size:13px;color:#b32017;display:none}
+  button[disabled]{opacity:.6}
+  .err{margin-top:10px;font-size:13px;color:#b32017;display:none;line-height:1.6}
+  .hint{margin-top:12px;font-size:12px;color:#98a2b3;line-height:1.6}
 </style>
 </head>
 <body>
 <div class="box">
   <h1>🍪 JD CK 助手</h1>
-  <p>请输入访问密码</p>
+  <p>请输入用户名和访问密码</p>
   <form onsubmit="return go(event)">
+    <input id="un" type="text" placeholder="用户名" autocomplete="username"
+           autocapitalize="off" autocorrect="off" spellcheck="false">
     <input id="pw" type="password" placeholder="访问密码" autocomplete="current-password">
-    <button type="submit">登 录</button>
+    <button type="submit" id="btn">登 录</button>
   </form>
   <div class="err" id="err"></div>
+  <div class="hint">忘记了？在路由器上查看 <code>data/auth.json</code> 所在目录，
+       或删除该文件后重启容器可重置登录保护。</div>
 </div>
 <script>
+var un=document.getElementById('un');
+try{un.value=localStorage.getItem('jdck_user')||''}catch(e){}
+if(!un.value){un.focus()}else{document.getElementById('pw').focus()}
 function go(e){
   e.preventDefault();
+  var u=un.value.trim(), p=document.getElementById('pw').value;
+  var el=document.getElementById('err'), btn=document.getElementById('btn');
+  if(!u||!p){el.style.display='block';el.textContent='❌ 请填写用户名和密码';return false}
+  btn.disabled=true;
   fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({pw:document.getElementById('pw').value})})
+    body:JSON.stringify({username:u,pw:p})})
     .then(r=>r.json())
     .then(d=>{
+      btn.disabled=false;
       if(d.ok){
+        try{localStorage.setItem('jdck_user',u)}catch(e){}
         // 保留 #ck= 片段（书签回跳时带到首页继续自动提交）
         location.href='/'+location.hash;
       }else{
-        const el=document.getElementById('err');
-        el.style.display='block';el.textContent='❌ '+(d.msg||'密码错误');
+        el.style.display='block';el.textContent='❌ '+(d.msg||'用户名或密码错误');
+        document.getElementById('pw').select();
       }
     })
-    .catch(()=>{const el=document.getElementById('err');
-      el.style.display='block';el.textContent='❌ 网络错误，请重试';});
+    .catch(()=>{btn.disabled=false;el.style.display='block';
+      el.textContent='❌ 网络错误，请重试';});
   return false;
 }
 </script>
@@ -599,11 +754,12 @@ class Handler(BaseHTTPRequestHandler):
                 ("Set-Cookie",
                  "%s=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax" % AUTH_COOKIE)])
             return
-        if AUTH_ENABLED and self._guard():
+        if AUTH_STATE["enabled"] and self._guard():
             return
         if path in ("/", "/index.html"):
             html = PAGE.replace("__ENV_NAME__", ENV_NAME).replace("__MODE__", MODE)
-            html = html.replace("__AUTH__", "1" if AUTH_ENABLED else "0")
+            html = html.replace("__AUTH__", "1" if AUTH_STATE["enabled"] else "0")
+            html = html.replace("__AUTH_USER__", escape(AUTH_STATE["username"]))
             self._send(200, html, "text/html; charset=utf-8")
         elif path == "/api/status":
             self._json({
@@ -633,26 +789,126 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0]
         body = self._body()
+        ip = self.address_string()
         if path == "/api/login":
-            ip = self.address_string()
             allowed, why = _login_allowed(ip)
             if not allowed:
                 self._json({"ok": False, "msg": why}, 429)
                 return
+            un = body.get("username", "")
             pw = body.get("pw", "")
-            if isinstance(pw, str) and pw and hmac.compare_digest(
-                    hashlib.sha256(pw.encode("utf-8")).hexdigest(),
-                    hashlib.sha256(ACCESS_PASSWORD.encode("utf-8")).hexdigest()):
+            ok = (AUTH_STATE["enabled"] and isinstance(un, str)
+                  and isinstance(pw, str)
+                  and hmac.compare_digest(un.strip(), AUTH_STATE["username"])
+                  and _check_pw(pw))
+            if ok:
                 _login_ok(ip)
                 self._send(200, '{"ok": true}', "application/json; charset=utf-8",
-                           extra=[("Set-Cookie",
-                                   "%s=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Lax"
-                                   % (AUTH_COOKIE, _auth_token(), AUTH_TTL))])
+                           extra=[("Set-Cookie", _session_cookie())])
             else:
                 _login_fail(ip)
-                self._json({"ok": False, "msg": "密码错误"}, 401)
+                self._json({"ok": False, "msg": "用户名或密码错误"}, 401)
             return
-        if AUTH_ENABLED and self._guard():
+        if path == "/api/auth/setup":
+            allowed, why = _login_allowed(ip)
+            if not allowed:
+                self._json({"ok": False, "msg": why}, 429)
+                return
+            un = body.get("username", "")
+            pw = body.get("pw", "")
+            err = _validate_cred(un, pw)
+            if not err and pw != body.get("pw2", ""):
+                err = "两次输入的密码不一致"
+            if err:
+                self._json({"ok": False, "msg": err})
+                return
+            with AUTH_LOCK:
+                if AUTH_STATE["enabled"]:
+                    err = "登录保护已启用，请用「修改」功能"
+                else:
+                    try:
+                        _set_cred(un, pw)
+                        err = ""
+                    except OSError as e:
+                        err = "写入凭据文件失败：%s" % e
+            if err:
+                self._json({"ok": False, "msg": err}, 403)
+                return
+            _login_ok(ip)
+            self._send(200, '{"ok": true}', "application/json; charset=utf-8",
+                       extra=[("Set-Cookie", _session_cookie())])
+            return
+        if AUTH_STATE["enabled"] and self._guard():
+            return
+        if path == "/api/auth/change":
+            allowed, why = _login_allowed(ip)
+            if not allowed:
+                self._json({"ok": False, "msg": why}, 429)
+                return
+            old = body.get("old_pw", "")
+            new_un = (body.get("username") or "").strip()
+            new_pw = body.get("pw") or ""
+            with AUTH_LOCK:
+                if not _check_pw(old):
+                    err = "当前密码不正确"
+                else:
+                    target = new_un or AUTH_STATE["username"]
+                    err = _validate_username(target)
+                    if not err and new_pw:
+                        err = _validate_password(new_pw)
+                        if not err and new_pw != (body.get("pw2") or ""):
+                            err = "两次输入的新密码不一致"
+                    if not err and not new_pw and target == AUTH_STATE["username"]:
+                        err = "没有需要保存的修改"
+                    if not err:
+                        if new_pw:
+                            salt = os.urandom(16).hex()
+                            AUTH_STATE.update({
+                                "salt": salt,
+                                "hash": _derive(new_pw, salt, PBKDF2_ITER),
+                                "iter": PBKDF2_ITER,
+                            })
+                        AUTH_STATE["username"] = target
+                        AUTH_STATE["enabled"] = True
+                        try:
+                            _auth_save()
+                        except OSError as e:
+                            err = "写入凭据文件失败：%s" % e
+                if err:
+                    _login_fail(ip)
+            if err:
+                self._json({"ok": False, "msg": err})
+                return
+            _login_ok(ip)
+            self._send(200, '{"ok": true}', "application/json; charset=utf-8",
+                       extra=[("Set-Cookie", _session_cookie())])
+            return
+        if path == "/api/auth/disable":
+            allowed, why = _login_allowed(ip)
+            if not allowed:
+                self._json({"ok": False, "msg": why}, 429)
+                return
+            with AUTH_LOCK:
+                if not _check_pw(body.get("pw", "")):
+                    err = "密码不正确"
+                else:
+                    err = ""
+                    AUTH_STATE.update({"enabled": False, "username": "",
+                                       "salt": "", "hash": "",
+                                       "iter": PBKDF2_ITER})
+                    try:
+                        _auth_save()
+                    except OSError as e:
+                        err = "写入凭据文件失败：%s" % e
+            if err:
+                _login_fail(ip)
+                self._json({"ok": False, "msg": err})
+                return
+            _login_ok(ip)
+            self._send(200, '{"ok": true}', "application/json; charset=utf-8",
+                       extra=[("Set-Cookie",
+                               "%s=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+                               % AUTH_COOKIE)])
             return
         if path == "/api/check":
             ck, pin, err = parse_ck(body.get("ck", ""))
@@ -759,15 +1015,82 @@ PAGE = r"""<!doctype html>
   #qrMsg.ok{color:var(--ok);font-weight:600}
   #qrMsg.err{color:#b32017}
   .qrsteps{font-size:13px;color:#333c4e;line-height:1.8;margin:4px 0 2px}
+  .warnbar{margin-top:14px;background:#fff8ed;border:1px solid #ffd8a8;color:#8a5312;
+           border-radius:12px;padding:12px 14px;font-size:13px;line-height:1.7}
+  .warnbar b{color:#b45309}
+  .warnbar .go{margin-top:9px;background:#d9822b;color:#fff;border:0;border-radius:8px;
+               padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer}
+  .fld{margin-top:11px}
+  .fld label{display:block;font-size:12px;color:var(--sub);margin-bottom:5px}
+  .fld input{width:100%;box-sizing:border-box;border:1px solid var(--line);border-radius:10px;
+             padding:11px;font-size:16px;background:#fbfcfe;color:var(--ink)}
+  .fld input:focus{outline:2px solid #ffc9c5;border-color:var(--brand)}
+  .btn.danger{background:#fff;border:1px solid #f3b6b0;color:#b32017}
+  .hintbox{font-size:12px;color:var(--sub);line-height:1.7;margin-top:2px}
+  .sep{margin-top:12px;border-top:1px dashed var(--line);padding-top:12px}
+  .who{font-weight:600;color:var(--brand)}
+  header a{color:#fff;text-decoration:underline;opacity:.9}
 </style>
 </head>
 <body>
 <header>
   <h1>🍪 JD CK 助手</h1>
-  <p>变量 <span id="envName">__ENV_NAME__</span> · 模式 <span id="modeName">__MODE__</span>
-     <a id="logoutLink" href="/logout" style="display:none;color:#fff;opacity:.85;margin-left:8px;font-size:12px">退出登录</a></p>
+  <p>变量 <span id="envName">__ENV_NAME__</span> · 模式 <span id="modeName">__MODE__</span></p>
+  <p style="margin-top:9px">
+    <a href="javascript:toggleSec()" id="secLink" style="font-size:12.5px">🔒 设置登录保护</a>
+    <a id="logoutLink" href="/logout" style="display:none;margin-left:14px;font-size:12.5px;opacity:.85">退出登录</a>
+  </p>
 </header>
 <main>
+
+  <div class="warnbar" id="secWarn" style="display:none">
+    ⚠️ <b>当前未开启登录保护</b>：任何能访问这个地址的人都能写入你的京东 CK。
+    若已通过 ddnsto / 端口映射暴露到外网，请立即设置用户名和密码。
+    <br><button class="go" onclick="toggleSec()">立即设置 →</button>
+  </div>
+
+  <div class="card" id="secCard" style="display:none">
+    <h2>🔐 登录保护</h2>
+
+    <div id="secSetup" style="display:none">
+      <div class="hintbox">首次设置：定一个用户名和强密码（至少 8 位）。保存后立即生效，
+        当前浏览器会自动保持登录；其它设备需用同样的用户名和密码登录。</div>
+      <div class="fld"><label>用户名</label>
+        <input id="suUser" value="admin" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+      <div class="fld"><label>密码（≥ 8 位）</label>
+        <input id="suPw" type="password" autocomplete="new-password"></div>
+      <div class="fld"><label>确认密码</label>
+        <input id="suPw2" type="password" autocomplete="new-password"></div>
+      <div class="msg" id="suMsg"></div>
+      <div class="grid2"><button class="btn primary" onclick="setupAuth()">启用登录保护</button></div>
+    </div>
+
+    <div id="secManage" style="display:none">
+      <div class="hintbox">当前用户名：<span class="who" id="curUser">__AUTH_USER__</span>。
+        修改用户名或密码后，<b>所有已登录设备立即失效</b>，需要重新登录。
+        只改其中一项时，另一项留空即可。</div>
+      <div class="fld"><label>当前密码（必填，用于验证身份）</label>
+        <input id="mgOld" type="password" autocomplete="current-password"></div>
+      <div class="fld"><label>新用户名（留空 = 不修改）</label>
+        <input id="mgUser" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="__AUTH_USER__"></div>
+      <div class="fld"><label>新密码（留空 = 不修改）</label>
+        <input id="mgPw" type="password" autocomplete="new-password"></div>
+      <div class="fld"><label>确认新密码</label>
+        <input id="mgPw2" type="password" autocomplete="new-password"></div>
+      <div class="msg" id="mgMsg"></div>
+      <div class="grid2">
+        <button class="btn primary" onclick="saveAuth()">保存修改</button>
+        <button class="btn ghost" onclick="showDisable()">关闭登录保护</button>
+      </div>
+      <div id="disableBox" class="sep" style="display:none">
+        <div class="hintbox" style="color:#b32017">⚠️ 关闭后任何能访问本页的人都能写入 CK，
+          仅建议在纯内网环境关闭。请输入当前密码确认。</div>
+        <div class="fld"><label>当前密码</label>
+          <input id="dsPw" type="password" autocomplete="current-password"></div>
+        <div class="grid2"><button class="btn danger" onclick="disableAuth()">确认关闭保护</button></div>
+      </div>
+    </div>
+  </div>
 
   <div class="card">
     <div class="row" style="justify-content:space-between">
@@ -980,9 +1303,79 @@ function checkHash(){
   return true;
 }
 
+/* ---------- 登录保护：设置 / 修改 / 关闭 ---------- */
+const AUTH_ON=('__AUTH__'==='1');
+function toggleSec(){
+  const c=$('secCard');
+  const open=(c.style.display==='none');
+  c.style.display=open?'':'none';
+  if(open)c.scrollIntoView({behavior:'smooth',block:'start'});
+}
+function secMsg(id,state,text){
+  const el=$(id);
+  el.className='msg'+(state?' '+state:'');
+  el.style.display='block';
+  el.textContent=text;
+}
+async function secPost(path,obj){
+  const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(obj)});
+  if(r.status===401&&AUTH_ON){location.href='/login';throw new Error('登录已过期，正在跳转登录页')}
+  if(r.status===429){let d={};try{d=await r.json()}catch(e){}throw new Error(d.msg||'操作过于频繁，请稍后再试')}
+  return r.json();
+}
+async function setupAuth(){
+  const un=$('suUser').value.trim(), pw=$('suPw').value;
+  if(!un){secMsg('suMsg','err','❌ 请填写用户名');return}
+  if(pw.length<8){secMsg('suMsg','err','❌ 密码至少 8 位');return}
+  if(pw!==$('suPw2').value){secMsg('suMsg','err','❌ 两次输入的密码不一致');return}
+  secMsg('suMsg','','⏳ 正在启用…');
+  try{
+    const d=await secPost('/api/auth/setup',{username:un,pw:pw,pw2:$('suPw2').value});
+    if(d.ok){secMsg('suMsg','ok','✅ 已启用登录保护，正在刷新…');setTimeout(()=>location.reload(),700)}
+    else secMsg('suMsg','err','❌ '+(d.msg||'设置失败'));
+  }catch(e){secMsg('suMsg','err','❌ '+e.message)}
+}
+async function saveAuth(){
+  const old=$('mgOld').value, np=$('mgPw').value;
+  if(!old){secMsg('mgMsg','err','❌ 请填写当前密码');return}
+  if(np&&np.length<8){secMsg('mgMsg','err','❌ 新密码至少 8 位');return}
+  if(np!==$('mgPw2').value){secMsg('mgMsg','err','❌ 两次输入的新密码不一致');return}
+  secMsg('mgMsg','','⏳ 正在保存…');
+  try{
+    const d=await secPost('/api/auth/change',{old_pw:old,username:$('mgUser').value.trim(),
+      pw:np,pw2:$('mgPw2').value});
+    if(d.ok){secMsg('mgMsg','ok','✅ 已保存，正在刷新…');setTimeout(()=>location.reload(),700)}
+    else secMsg('mgMsg','err','❌ '+(d.msg||'保存失败'));
+  }catch(e){secMsg('mgMsg','err','❌ '+e.message)}
+}
+function showDisable(){
+  const b=$('disableBox');
+  b.style.display=(b.style.display==='none')?'':'none';
+  if(b.style.display!=='none')$('dsPw').focus();
+}
+async function disableAuth(){
+  const pw=$('dsPw').value;
+  if(!pw){secMsg('mgMsg','err','❌ 请输入当前密码');return}
+  if(!confirm('确认关闭登录保护？关闭后任何能访问本页的人都能写入你的京东 CK。'))return;
+  secMsg('mgMsg','','⏳ 正在关闭…');
+  try{
+    const d=await secPost('/api/auth/disable',{pw:pw});
+    if(d.ok){secMsg('mgMsg','ok','✅ 已关闭，正在刷新…');setTimeout(()=>location.reload(),700)}
+    else secMsg('mgMsg','err','❌ '+(d.msg||'关闭失败'));
+  }catch(e){secMsg('mgMsg','err','❌ '+e.message)}
+}
+
 $('ckInput').addEventListener('input',parseCk);
 initBm();
-if('__AUTH__'==='1'){$('logoutLink').style.display=''}
+if(AUTH_ON){
+  $('logoutLink').style.display='';
+  $('secLink').textContent='⚙️ 安全设置';
+  $('secManage').style.display='';
+}else{
+  $('secWarn').style.display='';
+  $('secSetup').style.display='';
+}
 loadAccounts();
 if(checkHash()){
   showMsg('','');$('msg').className='msg';$('msg').style.display='block';
@@ -1000,9 +1393,16 @@ if(checkHash()){
 
 
 def main():
+    _auth_load()
     server = ThreadingHTTPServer((BIND_HOST, PORT), Handler)
     print("[jd-ck] 服务已启动: http://%s:%d  (青龙: %s, 变量: %s, 模式: %s)" % (
         BIND_HOST, PORT, QL_URL, ENV_NAME, MODE), flush=True)
+    if AUTH_STATE["enabled"]:
+        print("[jd-ck] 🔒 登录保护已启用（用户名: %s）" % AUTH_STATE["username"],
+              flush=True)
+    else:
+        print("[jd-ck] ⚠️ 未启用登录保护（可在页面「安全设置」中设置，仅建议纯内网使用）",
+              flush=True)
     if not (QL_CLIENT_ID and QL_CLIENT_SECRET):
         print("[jd-ck] ⚠️ 尚未配置 QL_CLIENT_ID / QL_CLIENT_SECRET")
     try:

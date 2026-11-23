@@ -1,6 +1,10 @@
 # 真实配置（含青龙密钥），不要提交
 .env
 
+# 登录凭据（PBKDF2 加盐哈希），不要提交
+data/
+auth.json
+
 # Python
 __pycache__/
 *.py[cod]

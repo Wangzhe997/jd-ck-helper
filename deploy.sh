@@ -52,5 +52,6 @@ IP=$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | he
 echo ""
 echo "✅ 部署完成"
 echo "   手机浏览器打开: http://${IP:-路由器IP}:${PORT}"
+echo "   首次使用: 打开页面 → 右上角「🔒 设置登录保护」设用户名和密码（外网访问前务必设置）"
 echo "   配置修改: 编辑 .env 后执行 docker compose up -d"
 echo "   查看日志: docker logs -f jd-ck-helper"
