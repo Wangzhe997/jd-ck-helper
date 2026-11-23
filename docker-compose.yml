@@ -15,4 +15,6 @@ services:
       - MODE=${MODE:-multi}
       - PORT=${PORT:-8787}
       - BIND_HOST=${BIND_HOST:-0.0.0.0}
+      # 访问密码（通过 ddnsto 等暴露到外网时务必设置强密码；留空=不启用认证，纯内网用）
+      - ACCESS_PASSWORD=${ACCESS_PASSWORD:-}
       - TZ=${TZ:-Asia/Shanghai}

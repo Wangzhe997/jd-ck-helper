@@ -15,8 +15,12 @@ JD CK 助手 —— 配合青龙面板使用的京东 Cookie 一键提交工具
   MODE               multi=一账号一个变量(推荐)；merge=全部账号合并进一个变量(换行分隔)
   PORT               监听端口，默认 8787
   BIND_HOST          监听地址，默认 0.0.0.0（Docker 用），本地测试可设 127.0.0.1
+  ACCESS_PASSWORD    访问密码；留空=不启用认证（纯内网）。通过 ddnsto 等暴露到
+                     外网时务必设置强密码
 """
 import base64
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -38,6 +42,19 @@ if MODE not in ("multi", "merge"):
     MODE = "multi"
 PORT = int(os.environ.get("PORT", "8787"))
 BIND_HOST = os.environ.get("BIND_HOST", "0.0.0.0").strip() or "0.0.0.0"
+ACCESS_PASSWORD = os.environ.get("ACCESS_PASSWORD", "").strip()
+AUTH_ENABLED = bool(ACCESS_PASSWORD)
+
+# 登录会话：HMAC 签名 cookie，有效期 30 天
+AUTH_SECRET = hashlib.sha256(("jd-ck-helper:" + ACCESS_PASSWORD).encode("utf-8")).digest()
+AUTH_TTL = 30 * 86400
+AUTH_COOKIE = "jdck_auth"
+
+# 登录失败限速：ip -> [失败次数, 锁定截止时间戳]
+LOGIN_FAILS = {}
+LOGIN_LOCK = threading.Lock()
+LOGIN_MAX_FAILS = 5
+LOGIN_LOCK_SECS = 120
 
 UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
       "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1")
@@ -407,6 +424,114 @@ def push_to_ql(ck, pin, nickname):
     return "; ".join(m for m in msgs if m)
 
 
+# ---------------------------------------------------------------- 访问认证
+
+def _auth_sign(exp):
+    return hmac.new(AUTH_SECRET, str(exp).encode("utf-8"),
+                    hashlib.sha256).hexdigest()[:32]
+
+
+def _auth_token():
+    exp = int(time.time()) + AUTH_TTL
+    return "%d.%s" % (exp, _auth_sign(exp))
+
+
+def _auth_ok(cookie_header):
+    if not AUTH_ENABLED:
+        return True
+    if not cookie_header:
+        return False
+    for part in cookie_header.split(";"):
+        name, _, value = part.strip().partition("=")
+        if name != AUTH_COOKIE:
+            continue
+        exp, _, sig = value.partition(".")
+        if not exp.isdigit() or not sig:
+            return False
+        if int(exp) < time.time():
+            return False
+        return hmac.compare_digest(sig, _auth_sign(exp))
+    return False
+
+
+def _login_allowed(ip):
+    with LOGIN_LOCK:
+        rec = LOGIN_FAILS.get(ip)
+        if rec and rec[0] >= LOGIN_MAX_FAILS and time.time() < rec[1]:
+            return False, "失败次数过多，已临时锁定，请 %d 秒后再试" % int(rec[1] - time.time())
+    return True, ""
+
+
+def _login_fail(ip):
+    with LOGIN_LOCK:
+        n, _ = LOGIN_FAILS.get(ip, (0, 0))
+        n += 1
+        LOGIN_FAILS[ip] = (n, time.time() + LOGIN_LOCK_SECS if n >= LOGIN_MAX_FAILS else 0)
+
+
+def _login_ok(ip):
+    with LOGIN_LOCK:
+        LOGIN_FAILS.pop(ip, None)
+
+
+LOGIN_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>JD CK 助手 · 登录</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+       background:linear-gradient(135deg,#e1251b,#ff5f52);font:-apple-system,BlinkMacSystemFont,
+       "PingFang SC","Segoe UI",Roboto,sans-serif}
+  .box{background:#fff;border-radius:16px;padding:28px 22px;width:86%;max-width:340px;
+       box-shadow:0 12px 40px rgba(0,0,0,.25)}
+  h1{margin:0 0 4px;font-size:20px;color:#1c2330}
+  p{margin:0 0 18px;font-size:13px;color:#7a8496}
+  input{width:100%;box-sizing:border-box;border:1px solid #e7ebf1;border-radius:10px;
+        padding:12px;font-size:16px;background:#fbfcfe;color:#1c2330}
+  input:focus{outline:2px solid #ffc9c5;border-color:#e1251b}
+  button{margin-top:12px;width:100%;border:0;border-radius:10px;padding:12px;
+         font-size:15px;font-weight:600;background:#e1251b;color:#fff;cursor:pointer}
+  button:active{transform:scale(.98)}
+  .err{margin-top:10px;font-size:13px;color:#b32017;display:none}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>🍪 JD CK 助手</h1>
+  <p>请输入访问密码</p>
+  <form onsubmit="return go(event)">
+    <input id="pw" type="password" placeholder="访问密码" autocomplete="current-password">
+    <button type="submit">登 录</button>
+  </form>
+  <div class="err" id="err"></div>
+</div>
+<script>
+function go(e){
+  e.preventDefault();
+  fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({pw:document.getElementById('pw').value})})
+    .then(r=>r.json())
+    .then(d=>{
+      if(d.ok){
+        // 保留 #ck= 片段（书签回跳时带到首页继续自动提交）
+        location.href='/'+location.hash;
+      }else{
+        const el=document.getElementById('err');
+        el.style.display='block';el.textContent='❌ '+(d.msg||'密码错误');
+      }
+    })
+    .catch(()=>{const el=document.getElementById('err');
+      el.style.display='block';el.textContent='❌ 网络错误，请重试';});
+  return false;
+}
+</script>
+</body>
+</html>
+"""
+
+
 # ---------------------------------------------------------------- HTTP 服务
 
 class Handler(BaseHTTPRequestHandler):
@@ -416,15 +541,6 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("[jd-ck] %s - %s\n" % (self.address_string(), fmt % args))
 
     # ---------- helpers ----------
-    def _send(self, status, content, ctype="application/json; charset=utf-8"):
-        data = content.encode("utf-8") if isinstance(content, str) else content
-        self.send_response(status)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(data)
-
     def _json(self, obj, status=200):
         self._send(status, json.dumps(obj, ensure_ascii=False))
 
@@ -439,11 +555,55 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError):
             return {}
 
+    # ---------- auth ----------
+    def _authed(self):
+        return _auth_ok(self.headers.get("Cookie"))
+
+    def _guard(self):
+        """未认证时返回 True 并已发送响应（页面跳登录页，接口返回 401）"""
+        if self._authed():
+            return False
+        if self.path.split("?")[0].startswith("/api/"):
+            self._json({"ok": False, "msg": "未登录或登录已过期"}, 401)
+        else:
+            self._send(302, "", "text/plain; charset=utf-8",
+                       extra=[("Location", "/login")])
+        return True
+
+    def _send(self, status, content, ctype="application/json; charset=utf-8",
+              extra=None):
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or []):
+            self.send_header(k, v)
+        self.end_headers()
+        if status not in (204, 302):
+            self.wfile.write(data)
+
     # ---------- routes ----------
     def do_GET(self):
         path = self.path.split("?")[0]
+        if path == "/login":
+            if self._authed():
+                self._send(302, "", "text/plain; charset=utf-8",
+                           extra=[("Location", "/")])
+            else:
+                self._send(200, LOGIN_PAGE, "text/html; charset=utf-8")
+            return
+        if path == "/logout":
+            self._send(302, "", "text/plain; charset=utf-8", extra=[
+                ("Location", "/login"),
+                ("Set-Cookie",
+                 "%s=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax" % AUTH_COOKIE)])
+            return
+        if AUTH_ENABLED and self._guard():
+            return
         if path in ("/", "/index.html"):
             html = PAGE.replace("__ENV_NAME__", ENV_NAME).replace("__MODE__", MODE)
+            html = html.replace("__AUTH__", "1" if AUTH_ENABLED else "0")
             self._send(200, html, "text/html; charset=utf-8")
         elif path == "/api/status":
             self._json({
@@ -473,6 +633,27 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0]
         body = self._body()
+        if path == "/api/login":
+            ip = self.address_string()
+            allowed, why = _login_allowed(ip)
+            if not allowed:
+                self._json({"ok": False, "msg": why}, 429)
+                return
+            pw = body.get("pw", "")
+            if isinstance(pw, str) and pw and hmac.compare_digest(
+                    hashlib.sha256(pw.encode("utf-8")).hexdigest(),
+                    hashlib.sha256(ACCESS_PASSWORD.encode("utf-8")).hexdigest()):
+                _login_ok(ip)
+                self._send(200, '{"ok": true}', "application/json; charset=utf-8",
+                           extra=[("Set-Cookie",
+                                   "%s=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Lax"
+                                   % (AUTH_COOKIE, _auth_token(), AUTH_TTL))])
+            else:
+                _login_fail(ip)
+                self._json({"ok": False, "msg": "密码错误"}, 401)
+            return
+        if AUTH_ENABLED and self._guard():
+            return
         if path == "/api/check":
             ck, pin, err = parse_ck(body.get("ck", ""))
             if err:
@@ -583,7 +764,8 @@ PAGE = r"""<!doctype html>
 <body>
 <header>
   <h1>🍪 JD CK 助手</h1>
-  <p>变量 <span id="envName">__ENV_NAME__</span> · 模式 <span id="modeName">__MODE__</span></p>
+  <p>变量 <span id="envName">__ENV_NAME__</span> · 模式 <span id="modeName">__MODE__</span>
+     <a id="logoutLink" href="/logout" style="display:none;color:#fff;opacity:.85;margin-left:8px;font-size:12px">退出登录</a></p>
 </header>
 <main>
 
@@ -691,6 +873,7 @@ function showMsg(ok,text){const m=$('msg');m.className='msg '+(ok?'ok':'err');m.
 
 async function api(path,body){
   const r=await fetch(path,body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{});
+  if(r.status===401){location.href='/login'+location.hash;throw new Error('登录已过期，正在跳转登录页')}
   return r.json();
 }
 
@@ -799,6 +982,7 @@ function checkHash(){
 
 $('ckInput').addEventListener('input',parseCk);
 initBm();
+if('__AUTH__'==='1'){$('logoutLink').style.display=''}
 loadAccounts();
 if(checkHash()){
   showMsg('','');$('msg').className='msg';$('msg').style.display='block';
