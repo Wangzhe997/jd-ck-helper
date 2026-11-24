@@ -167,6 +167,8 @@ def check_jd(ck):
 # sid -> {"cookies": "QRCodeKey=..;wlfstk_smdl=..", "token": wlfstk, "created": ts}
 QR_SESSIONS = {}
 QR_LOCK = threading.Lock()
+# 最近一次 ticket 换 CK 时京东的原始返回，供报错时诊断
+QR_LAST_DEBUG = ""
 
 
 def qr_new_session():
@@ -199,52 +201,65 @@ def qr_new_session():
     return sid, img
 
 
-def qr_exchange_ticket(ticket, token):
+def qr_exchange_ticket(ticket, session_cookies, token):
     """用 check 返回的 ticket 换取 pt_key/pt_pin。
 
-    京东在票务验证接口把 CK 通过 Set-Cookie 下发（常出现在 302 那一跳），
-    所以这里不跟随跳转，直接从响应头 + CookieJar 里收集，避免中间跳转把 CK 丢掉。
-    返回 (pt_key, pt_pin)，取不到则为 (None, None)。
+    参考京东真实登录流程：携带完整会话 Cookie（含 wlfstk_smdl、QRCodeKey 等），
+    Referer 必须是 passport 登录页，请求 qrCodeTicketValidation?t=<ticket>，
+    CK 由该接口通过 Set-Cookie 下发到 CookieJar。返回 (pt_key, pt_pin)。
     """
+    global QR_LAST_DEBUG
     from http.cookiejar import CookieJar
 
-    class _NoRedirect(urlreq.HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):
-            return None
-
     jar = CookieJar()
-    opener = urlreq.build_opener(_NoRedirect(), urlreq.HTTPCookieProcessor(jar))
-    ret = quote("https://home.m.jd.com/myJd/home.action", safe="")
+    opener = urlreq.build_opener(urlreq.HTTPCookieProcessor(jar))
     url = ("https://passport.jd.com/uc/qrCodeTicketValidation"
-           "?t=%s&ReturnUrl=%s&callback=jsonp" % (quote(ticket), ret))
+           "?t=%s" % quote(ticket))
     body = ""
+    # 关键：带上整个会话的 cookie（qr_new_session 拿到的全部 Set-Cookie），
+    # 而不只是 wlfstk_smdl；京东校验 Referer + 完整会话。
+    cookie_hdr = session_cookies or ("wlfstk_smdl=%s" % token)
     try:
         req = urlreq.Request(url, headers={
             "User-Agent": UA,
-            "Referer": "https://passport.jd.com/",
-            "Cookie": "wlfstk_smdl=%s" % token,
+            "Referer": "https://passport.jd.com/uc/login?ltype=logout",
+            "Cookie": cookie_hdr,
         })
         with opener.open(req, timeout=15) as resp:
             body = resp.read().decode("utf-8", "ignore")
-    except (HTTPError, URLError, OSError):
-        pass  # 未跟随跳转时 3xx 可能抛错，但 cookie 已在 jar 里
+    except HTTPError as e:
+        # 京东可能用 302 下发 Set-Cookie：urllib 默认跟随跳转，最终响应体才有用
+        try:
+            body = e.read().decode("utf-8", "ignore")
+        except Exception:
+            body = ""
+    except (URLError, OSError) as e:
+        QR_LAST_DEBUG = "请求票务验证接口失败：%s" % e
+        return (None, None)
+    QR_LAST_DEBUG = (body or "")[:300]
+
+    # 1) 先从 CookieJar 取（Set-Cookie 会被自动存进来）
     pool = {}
     try:
         for c in jar:
             pool[c.name] = c.value
     except Exception:
         pass
-    for line in re.findall(r"Set-Cookie:\s*([^\r\n]+)", body, re.I):
-        pair = line.split(";")[0].strip()
-        if "=" in pair:
-            k, v = pair.split("=", 1)
-            pool[k.strip()] = v.strip()
-    key, pin = pool.get("pt_key"), pool.get("pt_pin")
-    if not (key and pin):
+    # 2) 再从响应体里的 JSON/文本兜底
+    if not (pool.get("pt_key") and pool.get("pt_pin")):
+        try:
+            j = json.loads(body)
+            if isinstance(j, dict):
+                for k in ("pt_key", "pt_pin"):
+                    if j.get(k):
+                        pool[k] = str(j[k])
+        except Exception:
+            pass
         mk = re.search(r"pt_key=([^;&\s\"']+)", body)
         mp = re.search(r"pt_pin=([^;&\s\"']+)", body)
         if mk and mp:
-            key, pin = mk.group(1), mp.group(1)
+            pool["pt_key"], pool["pt_pin"] = mk.group(1), mp.group(1)
+    key, pin = pool.get("pt_key"), pool.get("pt_pin")
     return (key, pin) if (key and pin) else (None, None)
 
 
@@ -304,12 +319,13 @@ def qr_poll(sid):
                 QR_SESSIONS.pop(sid, None)
             return {"ok": False, "status": "error",
                     "msg": "扫码成功但京东未返回 ticket，请重试或改用短信登录"}
-        key, pin_raw = qr_exchange_ticket(str(ticket), ses["token"])
+        key, pin_raw = qr_exchange_ticket(str(ticket), ses["cookies"], ses["token"])
         with QR_LOCK:
             QR_SESSIONS.pop(sid, None)  # 会话已用掉
         if not key or not pin_raw:
+            hint = QR_LAST_DEBUG[:120] if QR_LAST_DEBUG else "无返回"
             return {"ok": False, "status": "error",
-                    "msg": "扫码成功但换 CK 失败：未从京东拿到 pt_key/pt_pin，请重试或用短信登录"}
+                    "msg": "扫码成功但换 CK 失败：京东返回「%s」，请重试或用短信登录" % hint}
         ck = "pt_key=%s;pt_pin=%s;" % (key, pin_raw)
         pin = unquote(pin_raw)
         chk = check_jd(ck)
