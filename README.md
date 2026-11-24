@@ -60,9 +60,9 @@ sh deploy.sh                  # 交互式填写青龙凭据，自动构建启动
 > ```
 > 备选前缀（某个失效就换下一个）：`https://gh-proxy.com/` · `https://ghproxy.net/`
 >
-> 完全不想用 git 时，也可下载压缩包（无需 git 环境），同样走加速：
+> 完全不想用 git 时，也可下载压缩包（无需 git 环境）。**注意：codeload 域名走加速站常返回 403，压缩包请直连下载**：
 > ```bash
-> curl -L https://ghfast.top/https://codeload.github.com/Wangzhe997/jd-ck-helper/tar.gz/refs/heads/main -o jd-ck-helper.tgz
+> curl -L https://codeload.github.com/Wangzhe997/jd-ck-helper/tar.gz/refs/heads/main -o jd-ck-helper.tgz
 > tar -xzf jd-ck-helper.tgz && cd jd-ck-helper-main && sh deploy.sh
 > ```
 
