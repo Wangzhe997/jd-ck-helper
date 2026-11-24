@@ -73,10 +73,6 @@ LOGIN_LOCK_SECS = 120
 UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
       "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1")
 
-# 京东扫码登录（qr.m.jd.com），可整体替换便于测试
-QR_HOST = "https://qr.m.jd.com"
-QR_APPID = "133"
-QR_TTL = 180  # 二维码有效期（秒）
 JD_ME_URL = "https://me-api.jd.com/user_new/info/GetJDUserInfoUnion"
 
 
@@ -162,190 +158,6 @@ def check_jd(ck):
     return {"ok": False, "msg": hint or "CK 已失效或格式错误（京东返回无昵称）"}
 
 
-# ---------------------------------------------------------------- 京东扫码登录
-
-# sid -> {"cookies": "QRCodeKey=..;wlfstk_smdl=..", "token": wlfstk, "created": ts}
-QR_SESSIONS = {}
-QR_LOCK = threading.Lock()
-# 最近一次 ticket 换 CK 时京东的原始返回，供报错时诊断
-QR_LAST_DEBUG = ""
-
-
-def qr_new_session():
-    """向京东申请登录二维码。返回 (sid, 图片bytes)。"""
-    t = str(int(time.time() * 1000))
-    url = "%s/show?appid=%s&size=300&t=%s" % (QR_HOST, QR_APPID, t)
-    req = urlreq.Request(url, headers={
-        "User-Agent": UA, "Referer": "https://passport.jd.com/"})
-    with urlreq.urlopen(req, timeout=15) as resp:
-        img = resp.read()
-        cookie_pairs = []
-        for line in (resp.headers.get_all("Set-Cookie") or []):
-            pair = line.split(";")[0].strip()
-            if "=" in pair:
-                cookie_pairs.append(pair)
-    jar = dict(p.split("=", 1) for p in cookie_pairs if "=" in p)
-    if "wlfstk_smdl" not in jar:
-        raise RuntimeError("京东二维码接口异常：未返回 wlfstk_smdl")
-    sid = uuid.uuid4().hex[:16]
-    with QR_LOCK:
-        # 顺手清理过期会话
-        now = time.time()
-        for k in [k for k, v in QR_SESSIONS.items() if now - v["created"] > QR_TTL + 30]:
-            QR_SESSIONS.pop(k, None)
-        QR_SESSIONS[sid] = {
-            "cookies": "; ".join(cookie_pairs),
-            "token": jar["wlfstk_smdl"],
-            "created": now,
-        }
-    return sid, img
-
-
-def qr_exchange_ticket(ticket, session_cookies, token):
-    """用 check 返回的 ticket 换取 pt_key/pt_pin。
-
-    参考京东真实登录流程：携带完整会话 Cookie（含 wlfstk_smdl、QRCodeKey 等），
-    Referer 必须是 passport 登录页，请求 qrCodeTicketValidation?t=<ticket>，
-    CK 由该接口通过 Set-Cookie 下发到 CookieJar。返回 (pt_key, pt_pin)。
-    """
-    global QR_LAST_DEBUG
-    from http.cookiejar import CookieJar
-
-    jar = CookieJar()
-    opener = urlreq.build_opener(urlreq.HTTPCookieProcessor(jar))
-    url = ("https://passport.jd.com/uc/qrCodeTicketValidation"
-           "?t=%s" % quote(ticket))
-    body = ""
-    # 关键：带上整个会话的 cookie（qr_new_session 拿到的全部 Set-Cookie），
-    # 而不只是 wlfstk_smdl；京东校验 Referer + 完整会话。
-    cookie_hdr = session_cookies or ("wlfstk_smdl=%s" % token)
-    try:
-        req = urlreq.Request(url, headers={
-            "User-Agent": UA,
-            "Referer": "https://passport.jd.com/uc/login?ltype=logout",
-            "Cookie": cookie_hdr,
-        })
-        with opener.open(req, timeout=15) as resp:
-            body = resp.read().decode("utf-8", "ignore")
-    except HTTPError as e:
-        # 京东可能用 302 下发 Set-Cookie：urllib 默认跟随跳转，最终响应体才有用
-        try:
-            body = e.read().decode("utf-8", "ignore")
-        except Exception:
-            body = ""
-    except (URLError, OSError) as e:
-        QR_LAST_DEBUG = "请求票务验证接口失败：%s" % e
-        return (None, None)
-    QR_LAST_DEBUG = (body or "")[:300]
-
-    # 1) 先从 CookieJar 取（Set-Cookie 会被自动存进来）
-    pool = {}
-    try:
-        for c in jar:
-            pool[c.name] = c.value
-    except Exception:
-        pass
-    # 2) 再从响应体里的 JSON/文本兜底
-    if not (pool.get("pt_key") and pool.get("pt_pin")):
-        try:
-            j = json.loads(body)
-            if isinstance(j, dict):
-                for k in ("pt_key", "pt_pin"):
-                    if j.get(k):
-                        pool[k] = str(j[k])
-        except Exception:
-            pass
-        mk = re.search(r"pt_key=([^;&\s\"']+)", body)
-        mp = re.search(r"pt_pin=([^;&\s\"']+)", body)
-        if mk and mp:
-            pool["pt_key"], pool["pt_pin"] = mk.group(1), mp.group(1)
-    key, pin = pool.get("pt_key"), pool.get("pt_pin")
-    return (key, pin) if (key and pin) else (None, None)
-
-
-def qr_poll(sid):
-    """轮询扫码状态。返回前端可直接使用的结果 dict。
-
-    京东 check 返回码：200 已确认(附 ticket) / 201 未扫描 / 202 已扫待确认
-    / 203 已过期 / 205 已取消；其它视为异常。
-    """
-    with QR_LOCK:
-        ses = QR_SESSIONS.get(sid)
-    if not ses:
-        return {"ok": False, "status": "gone",
-                "msg": "二维码会话不存在或已过期，请重新生成"}
-    if time.time() - ses["created"] > QR_TTL:
-        with QR_LOCK:
-            QR_SESSIONS.pop(sid, None)
-        return {"ok": False, "status": "expired",
-                "msg": "二维码已过期，请重新生成"}
-
-    t = str(int(time.time() * 1000))
-    url = ("%s/check?callback=cb&appid=%s&token=%s&_=%s"
-           % (QR_HOST, QR_APPID, quote(ses["token"]), t))
-    req = urlreq.Request(url, method="POST", headers={
-        "User-Agent": UA, "Referer": "https://passport.jd.com/",
-        "Cookie": ses["cookies"]})
-    try:
-        with urlreq.urlopen(req, timeout=15) as resp:
-            body = resp.read().decode("utf-8", "ignore")
-    except (HTTPError, URLError, OSError) as e:
-        return {"ok": False, "status": "waiting", "msg": "查询扫码状态失败，稍后重试: %s" % e}
-
-    m = re.search(r"\((\{.*\})\)", body, re.S)
-    try:
-        data = json.loads(body)
-    except ValueError:
-        data = None
-    if data is None and m:
-        try:
-            data = json.loads(m.group(1))
-        except ValueError:
-            data = None
-    if not isinstance(data, dict):
-        return {"ok": False, "status": "expired",
-                "msg": "京东返回格式异常，请重新生成二维码"}
-
-    code = data.get("code")
-    if code == 200:
-        # 关键修复：code=200 时京东给的是 ticket，不是直接带 CK 的 url。
-        # 必须拿 ticket 再请求一次票务验证接口，从 Set-Cookie 里取 pt_key/pt_pin。
-        ticket = data.get("ticket") or ""
-        if not ticket and data.get("url"):
-            m = re.search(r"[?&]t=([^&]+)", str(data["url"]))
-            ticket = unquote(m.group(1)) if m else ""
-        if not ticket:
-            with QR_LOCK:
-                QR_SESSIONS.pop(sid, None)
-            return {"ok": False, "status": "error",
-                    "msg": "扫码成功但京东未返回 ticket，请重试或改用短信登录"}
-        key, pin_raw = qr_exchange_ticket(str(ticket), ses["cookies"], ses["token"])
-        with QR_LOCK:
-            QR_SESSIONS.pop(sid, None)  # 会话已用掉
-        if not key or not pin_raw:
-            hint = QR_LAST_DEBUG[:120] if QR_LAST_DEBUG else "无返回"
-            return {"ok": False, "status": "error",
-                    "msg": "扫码成功但换 CK 失败：京东返回「%s」，请重试或用短信登录" % hint}
-        ck = "pt_key=%s;pt_pin=%s;" % (key, pin_raw)
-        pin = unquote(pin_raw)
-        chk = check_jd(ck)
-        if not chk["ok"]:
-            return {"ok": False, "status": "error",
-                    "msg": "扫码得到的 CK 校验未通过：%s" % chk.get("msg", "")}
-        try:
-            detail = push_to_ql(ck, pin_raw, chk.get("nickname") or "")
-        except RuntimeError as e:
-            return {"ok": False, "status": "error",
-                    "msg": "CK 校验通过但写入青龙失败：%s" % e, "pin": pin}
-        return {"ok": True, "status": "confirmed", "nickname": chk.get("nickname"),
-                "pin": pin, "detail": detail}
-    if code == 201:
-        return {"ok": False, "status": "waiting", "msg": "等待扫码"}
-    if code == 202:
-        return {"ok": False, "status": "scanned", "msg": "已扫描，请在手机上点「确认登录」"}
-    # 203 过期 / 205 取消 / 其它异常
-    return {"ok": False, "status": "expired",
-            "msg": "二维码已失效（%s），请重新生成" % (data.get("msg") or code)}
 
 
 # ---------------------------------------------------------------- 青龙 Open API
@@ -919,17 +731,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "accounts": accounts_overview(token)})
             except RuntimeError as e:
                 self._json({"ok": False, "msg": str(e)})
-        elif path == "/api/qrcode":
-            try:
-                sid, img = qr_new_session()
-                self._json({"ok": True, "sid": sid,
-                            "img": "data:image/png;base64," + _b64(img)})
-            except (RuntimeError, HTTPError, URLError, OSError) as e:
-                self._json({"ok": False, "msg": "获取二维码失败：%s" % e})
-        elif path == "/api/qrcheck":
-            sid = (self.path.split("sid=", 1)[1].split("&")[0]
-                   if "sid=" in self.path else "")
-            self._json(qr_poll(sid))
         else:
             self._send(404, "not found", "text/plain; charset=utf-8")
 
@@ -1155,13 +956,10 @@ PAGE = r"""<!doctype html>
   .spin{display:inline-block;animation:r 1s linear infinite}
   @keyframes r{to{transform:rotate(360deg)}}
   code.k{background:#f1f3f7;border-radius:5px;padding:1px 5px;font-size:12px}
-  #qrBox{text-align:center;margin:8px 0}
-  #qrBox img{width:220px;height:220px;border:1px solid var(--line);border-radius:10px;
-             background:#fff;padding:6px}
-  #qrMsg{font-size:13px;margin-top:6px;color:var(--sub);min-height:20px}
-  #qrMsg.ok{color:var(--ok);font-weight:600}
-  #qrMsg.err{color:#b32017}
   .qrsteps{font-size:13px;color:#333c4e;line-height:1.8;margin:4px 0 2px}
+  .notice{border-left:4px solid var(--brand)}
+  /* 方法卡片网格：宽屏两列并排，窄屏自动单列 */
+  .methods{display:grid;grid-template-columns:1fr;gap:14px}
   .warnbar{margin-top:14px;background:#fff8ed;border:1px solid #ffd8a8;color:#8a5312;
            border-radius:12px;padding:12px 14px;font-size:13px;line-height:1.7}
   .warnbar b{color:#b45309}
@@ -1177,6 +975,25 @@ PAGE = r"""<!doctype html>
   .sep{margin-top:12px;border-top:1px dashed var(--line);padding-top:12px}
   .who{font-weight:600;color:var(--brand)}
   header a{color:#fff;text-decoration:underline;opacity:.9}
+  /* ---------- 响应式：手机单列，平板/电脑放宽并多列，避免宽屏上挤成窄条 ---------- */
+  @media(min-width:720px){
+    header{padding:26px 0 22px;text-align:center}
+    header h1{font-size:24px}
+    header p{font-size:13px}
+    main{max-width:820px;padding:0 24px}
+    .card{padding:20px 22px}
+    .card h2{font-size:16px}
+    .methods{grid-template-columns:repeat(2,minmax(0,1fr))}
+  }
+  @media(min-width:1080px){
+    header{padding:32px 0 26px}
+    header h1{font-size:28px}
+    main{max-width:1040px;padding:0 32px}
+    .methods{grid-template-columns:repeat(3,minmax(0,1fr))}
+    .card{padding:22px 24px}
+    /* 电脑端让说明类卡片跨满整行，更易读 */
+    .notice{grid-column:1/-1}
+  }
 </style>
 </head>
 <body>
@@ -1247,19 +1064,17 @@ PAGE = r"""<!doctype html>
     <div id="accList" class="tip">已提交账号：加载中…</div>
   </div>
 
-  <div class="card">
-    <h2>① 扫码登录（身边有两台设备时最方便）</h2>
-    <div class="qrsteps">点「生成二维码」→ 手机京东 App 里 <b>扫一扫</b>（首页右上角 +/- 号进入）→ 手机上点 <b>确认登录</b> → 自动校验并提交青龙。<b>换账号</b>：切换京东 App 登录的账号（或换家人手机）后重新扫码即可。</div>
-    <div class="grid2">
-      <button class="btn primary" id="qrBtn" onclick="startQr()">生成二维码</button>
-      <button class="btn ghost" onclick="startQr()">刷新二维码</button>
+  <div class="card notice">
+    <h2>📌 关于扫码登录</h2>
+    <div class="tip" style="font-size:13px;margin-top:0">
+      ⚠️ <b>扫码登录已移除</b>：本工具运行在服务器（软路由）上，扫码请求由服务器 IP 发出，京东会判定登录环境异常并强制滑块安全验证（<code class="k">riskCode 1100</code>），程序无法自动通过，CK 始终下发不了。为避免每次白试，已下线该功能，请用下面两种稳定方式：<b>① 油猴脚本</b> 或 <b>② 手动粘贴 / ③ 抓包</b>。
     </div>
-    <div id="qrBox" style="display:none"><img id="qrImg" alt="京东登录二维码"></div>
-    <div id="qrMsg"></div>
   </div>
 
+  <div class="methods">
+
   <div class="card">
-    <h2>② 短信验证码登录 · 油猴脚本一键提取（单手机推荐）</h2>
+    <h2>① 短信验证码登录 · 油猴脚本一键提取（单手机推荐）</h2>
     <div class="qrsteps">1. 手机浏览器装好 <b>Tampermonkey（油猴）</b> 插件<br>2. 点下面「安装油猴脚本」→ 在弹窗里确认安装（脚本会自动带上本工具地址）<br>3. 打开 <b>m.jd.com</b> → 选 <b>「手机验证码登录」</b> 登录成功<br>4. 页面上会出现红色悬浮按钮 <b>「提取CK→青龙」</b>，点它即自动跳回本页提交，<b>全程零复制粘贴</b></div>
     <div class="grid2" style="margin-top:10px">
       <button class="btn primary" id="bmInstall" onclick="installUserscript()">安装油猴脚本</button>
@@ -1270,7 +1085,7 @@ PAGE = r"""<!doctype html>
   </div>
 
   <div class="card">
-    <h2>③ 手动粘贴 Cookie（备用）</h2>
+    <h2>② 手动粘贴 Cookie（备用）</h2>
     <textarea id="ckInput" placeholder="把整段 Cookie 粘贴到这里（乱七八糟没关系，会自动只保留 pt_key / pt_pin）"></textarea>
     <div class="preview" id="preview">识别到账号：<b>—</b></div>
     <div class="grid2">
@@ -1281,7 +1096,7 @@ PAGE = r"""<!doctype html>
   </div>
 
   <div class="card">
-    <h2>④ 开发者工具 / 抓包取 CK（备用）</h2>
+    <h2>③ 开发者工具 / 抓包取 CK（备用）</h2>
     <div class="tabs">
       <div class="tab on" id="tabIos" onclick="switchTab('ios')">iPhone</div>
       <div class="tab" id="tabAnd" onclick="switchTab('android')">安卓</div>
@@ -1304,6 +1119,8 @@ PAGE = r"""<!doctype html>
       <div class="tip">App CK：HttpCanary / Reqable 抓包京东 App 的 <code class="k">api.m.jd.com</code> 请求，复制 Cookie 头。</div>
     </div>
   </div>
+
+  </div><!-- /methods -->
 
   <div class="card">
     <h2>为什么 CK 老是掉？</h2>
@@ -1368,43 +1185,6 @@ async function doPush(auto){
       $('ckInput').value='';parseCk();loadAccounts()}
     else{showMsg(false,'❌ 提交失败：'+esc(r.msg))}
   }catch(e){showMsg(false,'❌ 请求失败：'+esc(e.message))}
-}
-
-/* ---------- 扫码登录 ---------- */
-let qrTimer=null,qrSid='',qrBusy=false;
-function qrShow(ok,text){
-  const m=$('qrMsg');
-  m.className=ok===null?'':(ok?'ok':'err');
-  m.innerHTML=text;
-}
-async function startQr(){
-  if(qrBusy)return; qrBusy=true;
-  stopQr(); qrShow(null,'⏳ 正在向京东申请二维码…');
-  try{
-    const r=await api('/api/qrcode');
-    if(!r.ok){qrShow(false,'❌ '+esc(r.msg));qrBusy=false;return}
-    qrSid=r.sid; $('qrImg').src=r.img; $('qrBox').style.display='';
-    qrShow(null,'请用手机京东 App 扫一扫（二维码约 3 分钟内有效）');
-    qrTimer=setInterval(pollQr,2000);
-  }catch(e){qrShow(false,'❌ '+esc(e.message))}
-  qrBusy=false;
-}
-function stopQr(){if(qrTimer){clearInterval(qrTimer);qrTimer=null}}
-async function pollQr(){
-  if(!qrSid)return;
-  let r;
-  try{r=await api('/api/qrcheck?sid='+encodeURIComponent(qrSid))}
-  catch(e){return}
-  if(r.status==='waiting'){qrShow(null,'📷 等待扫码…')}
-  else if(r.status==='scanned'){qrShow(null,'✅ 已扫描，请在手机上点「确认登录」')}
-  else if(r.status==='confirmed'){
-    stopQr();qrSid='';
-    qrShow(true,'🎉 登录成功！账号 <b>'+esc(r.nickname||r.pin)+'</b> 已自动提交青龙<br>'+esc(r.detail));
-    loadAccounts();
-  }else{
-    stopQr();qrSid='';
-    qrShow(false,'⚠️ '+esc(r.msg||'二维码已失效')+'，请点「生成二维码」重试');
-  }
 }
 
 async function loadAccounts(){
