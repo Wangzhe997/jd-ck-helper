@@ -199,10 +199,60 @@ def qr_new_session():
     return sid, img
 
 
+def qr_exchange_ticket(ticket, token):
+    """用 check 返回的 ticket 换取 pt_key/pt_pin。
+
+    京东在票务验证接口把 CK 通过 Set-Cookie 下发（常出现在 302 那一跳），
+    所以这里不跟随跳转，直接从响应头 + CookieJar 里收集，避免中间跳转把 CK 丢掉。
+    返回 (pt_key, pt_pin)，取不到则为 (None, None)。
+    """
+    from http.cookiejar import CookieJar
+
+    class _NoRedirect(urlreq.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    jar = CookieJar()
+    opener = urlreq.build_opener(_NoRedirect(), urlreq.HTTPCookieProcessor(jar))
+    ret = quote("https://home.m.jd.com/myJd/home.action", safe="")
+    url = ("https://passport.jd.com/uc/qrCodeTicketValidation"
+           "?t=%s&ReturnUrl=%s&callback=jsonp" % (quote(ticket), ret))
+    body = ""
+    try:
+        req = urlreq.Request(url, headers={
+            "User-Agent": UA,
+            "Referer": "https://passport.jd.com/",
+            "Cookie": "wlfstk_smdl=%s" % token,
+        })
+        with opener.open(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8", "ignore")
+    except (HTTPError, URLError, OSError):
+        pass  # 未跟随跳转时 3xx 可能抛错，但 cookie 已在 jar 里
+    pool = {}
+    try:
+        for c in jar:
+            pool[c.name] = c.value
+    except Exception:
+        pass
+    for line in re.findall(r"Set-Cookie:\s*([^\r\n]+)", body, re.I):
+        pair = line.split(";")[0].strip()
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            pool[k.strip()] = v.strip()
+    key, pin = pool.get("pt_key"), pool.get("pt_pin")
+    if not (key and pin):
+        mk = re.search(r"pt_key=([^;&\s\"']+)", body)
+        mp = re.search(r"pt_pin=([^;&\s\"']+)", body)
+        if mk and mp:
+            key, pin = mk.group(1), mp.group(1)
+    return (key, pin) if (key and pin) else (None, None)
+
+
 def qr_poll(sid):
     """轮询扫码状态。返回前端可直接使用的结果 dict。
 
-    京东 check 返回码：200 已确认(附 url) / 201 未扫描 / 176 已扫待确认 / 其它视为过期或异常
+    京东 check 返回码：200 已确认(附 ticket) / 201 未扫描 / 202 已扫待确认
+    / 203 已过期 / 205 已取消；其它视为异常。
     """
     with QR_LOCK:
         ses = QR_SESSIONS.get(sid)
@@ -242,23 +292,32 @@ def qr_poll(sid):
                 "msg": "京东返回格式异常，请重新生成二维码"}
 
     code = data.get("code")
-    if code == 200 and data.get("url"):
+    if code == 200:
+        # 关键修复：code=200 时京东给的是 ticket，不是直接带 CK 的 url。
+        # 必须拿 ticket 再请求一次票务验证接口，从 Set-Cookie 里取 pt_key/pt_pin。
+        ticket = data.get("ticket") or ""
+        if not ticket and data.get("url"):
+            m = re.search(r"[?&]t=([^&]+)", str(data["url"]))
+            ticket = unquote(m.group(1)) if m else ""
+        if not ticket:
+            with QR_LOCK:
+                QR_SESSIONS.pop(sid, None)
+            return {"ok": False, "status": "error",
+                    "msg": "扫码成功但京东未返回 ticket，请重试或改用短信登录"}
+        key, pin_raw = qr_exchange_ticket(str(ticket), ses["token"])
         with QR_LOCK:
             QR_SESSIONS.pop(sid, None)  # 会话已用掉
-        login_url = str(data["url"])
-        m_key = re.search(r"pt_key=([^;&\s]+)", login_url)
-        m_pin = re.search(r"pt_pin=([^;&\s]+)", login_url)
-        if not m_key or not m_pin:
+        if not key or not pin_raw:
             return {"ok": False, "status": "error",
-                    "msg": "扫码成功但未从返回中解析到 pt_key/pt_pin，请改用粘贴方式"}
-        ck = "pt_key=%s;pt_pin=%s;" % (m_key.group(1), m_pin.group(1))
-        pin = unquote(m_pin.group(1))
+                    "msg": "扫码成功但换 CK 失败：未从京东拿到 pt_key/pt_pin，请重试或用短信登录"}
+        ck = "pt_key=%s;pt_pin=%s;" % (key, pin_raw)
+        pin = unquote(pin_raw)
         chk = check_jd(ck)
         if not chk["ok"]:
             return {"ok": False, "status": "error",
                     "msg": "扫码得到的 CK 校验未通过：%s" % chk.get("msg", "")}
         try:
-            detail = push_to_ql(ck, m_pin.group(1), chk.get("nickname") or "")
+            detail = push_to_ql(ck, pin_raw, chk.get("nickname") or "")
         except RuntimeError as e:
             return {"ok": False, "status": "error",
                     "msg": "CK 校验通过但写入青龙失败：%s" % e, "pin": pin}
@@ -266,11 +325,11 @@ def qr_poll(sid):
                 "pin": pin, "detail": detail}
     if code == 201:
         return {"ok": False, "status": "waiting", "msg": "等待扫码"}
-    if code == 176:
+    if code == 202:
         return {"ok": False, "status": "scanned", "msg": "已扫描，请在手机上点「确认登录」"}
-    # 202/257 等均视为过期/异常
+    # 203 过期 / 205 取消 / 其它异常
     return {"ok": False, "status": "expired",
-            "msg": "二维码已失效（%s），请重新生成" % data.get("msg", code)}
+            "msg": "二维码已失效（%s），请重新生成" % (data.get("msg") or code)}
 
 
 # ---------------------------------------------------------------- 青龙 Open API
@@ -670,7 +729,7 @@ function go(e){
       btn.disabled=false;
       if(d.ok){
         try{localStorage.setItem('jdck_user',u)}catch(e){}
-        // 保留 #ck= 片段（书签回跳时带到首页继续自动提交）
+        // 保留 #ck= 片段（油猴脚本回跳时带到首页继续自动提交）
         location.href='/'+location.hash;
       }else{
         el.style.display='block';el.textContent='❌ '+(d.msg||'用户名或密码错误');
@@ -684,6 +743,70 @@ function go(e){
 </script>
 </body>
 </html>
+"""
+
+
+# ---------------------------------------------------------------- 油猴脚本
+# 京东 pt_key 是 HttpOnly，普通 javascript: 书签读不到；油猴的 GM_cookie 可以。
+# 脚本由服务端动态生成，把本工具地址烤进去，用户只需安装一次。
+USERSCRIPT = """// ==UserScript==
+// @name         JD CK 助手 - 一键提取 Cookie
+// @namespace    https://github.com/Wangzhe997/jd-ck-helper
+// @version      1.0
+// @description  在京东页面一键读取 pt_key/pt_pin（含 HttpOnly）并回传给 JD CK 助手
+// @match        https://*.jd.com/*
+// @match        http://*.jd.com/*
+// @grant        GM_cookie
+// @grant        GM_registerMenuCommand
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+  var TOOL = '__BASE__';
+
+  function extract() {
+    var sent = false;
+    function back(ck) {
+      if (sent) return;
+      sent = true;
+      location.href = TOOL + '/?from=jd#ck=' + encodeURIComponent(ck);
+    }
+    if (typeof GM_cookie === 'undefined' || !GM_cookie.list) {
+      alert('当前脚本管理器不支持 GM_cookie。请使用 Tampermonkey，并在脚本设置中允许 Cookie 权限。');
+      return;
+    }
+    GM_cookie.list({ url: 'https://m.jd.com/' }, function (cookies, err) {
+      if (err || !cookies) {
+        alert('读取 Cookie 失败：' + (err && err.message || '未知错误'));
+        return;
+      }
+      var key = '', pin = '';
+      for (var i = 0; i < cookies.length; i++) {
+        if (cookies[i].name === 'pt_key') key = cookies[i].value;
+        if (cookies[i].name === 'pt_pin') pin = cookies[i].value;
+      }
+      if (!key || !pin) {
+        alert('还没读到京东登录态：请先在 m.jd.com 用短信验证码登录成功后再点。');
+        return;
+      }
+      back('pt_key=' + key + ';pt_pin=' + pin + ';');
+    });
+  }
+
+  if (typeof GM_registerMenuCommand === 'function') {
+    GM_registerMenuCommand('提取 CK 并提交到青龙', extract);
+  }
+
+  var btn = document.createElement('div');
+  btn.textContent = '提取CK\\u2192青龙';
+  btn.style.cssText = 'position:fixed;right:12px;bottom:18px;z-index:999999;' +
+    'padding:10px 15px;background:#e1251b;color:#fff;border-radius:22px;' +
+    'font-size:14px;line-height:1;box-shadow:0 2px 10px rgba(0,0,0,.28);' +
+    'cursor:pointer;user-select:none';
+  btn.addEventListener('click', extract);
+  if (document.body) document.body.appendChild(btn);
+})();
 """
 
 
@@ -753,6 +876,14 @@ class Handler(BaseHTTPRequestHandler):
                 ("Location", "/login"),
                 ("Set-Cookie",
                  "%s=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax" % AUTH_COOKIE)])
+            return
+        if path == "/ck.user.js":
+            # 让脚本从当前访问的 Host 自动生成回跳地址，兼容 ddnsto 穿透域名
+            host = self.headers.get("Host") or ("127.0.0.1:%d" % PORT)
+            proto = (self.headers.get("X-Forwarded-Proto") or "http").split(",")[0].strip()
+            base = "%s://%s" % (proto, host)
+            self._send(200, USERSCRIPT.replace("__BASE__", base),
+                       "application/javascript; charset=utf-8")
             return
         if AUTH_STATE["enabled"] and self._guard():
             return
@@ -1112,15 +1243,14 @@ PAGE = r"""<!doctype html>
   </div>
 
   <div class="card">
-    <h2>② 短信验证码登录 · 一键提取（单手机推荐）</h2>
-    <div class="qrsteps">1. 手机浏览器打开 <b>m.jd.com</b> → 选择 <b>「手机验证码登录」</b>（偶尔出滑块验证，正常拖过即可）<br>2. 登录成功后，停在京东任意页面，点一下收藏夹里的 <b>「提取CK」</b> 书签<br>3. 自动跳回本页并提交青龙，<b>全程无需复制粘贴</b></div>
-    <div style="margin-top:10px"><textarea id="bmCode" readonly style="min-height:64px;font-size:11px"></textarea></div>
-    <div class="grid2">
-      <button class="btn ghost" onclick="copyBm()">复制书签代码</button>
-      <button class="btn primary" onclick="gotoJd()">去 m.jd.com 登录</button>
+    <h2>② 短信验证码登录 · 油猴脚本一键提取（单手机推荐）</h2>
+    <div class="qrsteps">1. 手机浏览器装好 <b>Tampermonkey（油猴）</b> 插件<br>2. 点下面「安装油猴脚本」→ 在弹窗里确认安装（脚本会自动带上本工具地址）<br>3. 打开 <b>m.jd.com</b> → 选 <b>「手机验证码登录」</b> 登录成功<br>4. 页面上会出现红色悬浮按钮 <b>「提取CK→青龙」</b>，点它即自动跳回本页提交，<b>全程零复制粘贴</b></div>
+    <div class="grid2" style="margin-top:10px">
+      <button class="btn primary" id="bmInstall" onclick="installUserscript()">安装油猴脚本</button>
+      <button class="btn ghost" onclick="gotoJd()">去 m.jd.com 登录</button>
     </div>
     <div id="bmMsg" class="tip" style="color:var(--brand)"></div>
-    <div class="tip"><b>首次配置书签（iOS Safari）：</b>随便把任何页面「添加到书签」→ 打开「编辑书签」→ 清空网址栏，粘贴上面复制的那段代码，名称改为「提取CK」。Alook / 安卓浏览器同理（添加书签时直接粘贴这段代码作为网址）。</div>
+    <div class="tip"><b>为什么要油猴而不是书签？</b> 京东把 <code class="k">pt_key</code> 设成了 HttpOnly，普通网页 JS（包括书签）根本读不到；只有油猴的 <code class="k">GM_cookie</code> 有权限读取，所以书签方案天生读不到 CK。<b>换账号</b>：在 m.jd.com 退出并登录另一个账号后，再点一次悬浮按钮即可。</div>
   </div>
 
   <div class="card">
@@ -1278,25 +1408,31 @@ async function loadAccounts(){
   }catch(e){$('qlStatus').textContent='连接失败';$('accList').innerHTML='❌ '+esc(e.message)}
 }
 
-/* ---------- 一键提取书签 ---------- */
-function initBm(){
-  const base=location.protocol+'//'+location.host;
-  $('bmCode').value="javascript:(function(){var c=document.cookie,k=c.match(/pt_key=([^;]+)/),p=c.match(/pt_pin=([^;]+)/);if(!k||!p){alert('还没读到京东CK：请先在 m.jd.com 完成登录后再点我。若登录后仍不行，请改用 Alook 浏览器（开发者工具-Cookies 复制）。');return;}location.href='"+base+"/#ck='+encodeURIComponent('pt_key='+k[1]+';pt_pin='+p[1]+';');})();";
-}
+/* ---------- 油猴脚本一键提取 ---------- */
 function showBm(t){$('bmMsg').textContent=t}
+function installUserscript(){
+  const url=location.protocol+'//'+location.host+'/ck.user.js';
+  showBm('正在打开脚本安装地址…若没有自动安装，请复制此地址到装了油猴的浏览器打开：'+url);
+  window.open(url,'_blank');
+}
 async function copyBm(){
-  const t=$('bmCode');t.focus();t.select();
+  const url=location.protocol+'//'+location.host+'/ck.user.js';
   let done=false;
-  try{await navigator.clipboard.writeText(t.value);done=true}catch(e){
-    try{done=document.execCommand('copy')}catch(e2){}
+  try{await navigator.clipboard.writeText(url);done=true}catch(e){
+    try{
+      const ta=document.createElement('textarea');ta.value=url;document.body.appendChild(ta);
+      ta.select();done=document.execCommand('copy');document.body.removeChild(ta);
+    }catch(e2){}
   }
-  showBm(done?'✅ 已复制！去「添加/编辑书签」，把这段代码粘贴到网址栏，名称改为「提取CK」':'复制失败，请长按代码框全选后手动复制');
-  if(done)setTimeout(()=>showBm(''),6000);
+  showBm(done?'✅ 已复制脚本地址，去装了油猴的浏览器打开安装':'复制失败，请手动打开：'+url);
+  if(done)setTimeout(()=>showBm(''),8000);
 }
 function gotoJd(){location.href='https://m.jd.com/'}
+let cameFromJd=false;
 function checkHash(){
   const m=location.hash.match(/[#&]ck=([^&]+)/);
   if(!m)return false;
+  cameFromJd=/[?&]from=jd\b/.test(location.search)||/jd\.com/.test(document.referrer||'');
   let ck;try{ck=decodeURIComponent(m[1])}catch(e){ck=m[1]}
   history.replaceState(null,'',location.pathname);
   $('ckInput').value=ck;parseCk();
@@ -1367,7 +1503,6 @@ async function disableAuth(){
 }
 
 $('ckInput').addEventListener('input',parseCk);
-initBm();
 if(AUTH_ON){
   $('logoutLink').style.display='';
   $('secLink').textContent='⚙️ 安全设置';
@@ -1379,8 +1514,8 @@ if(AUTH_ON){
 loadAccounts();
 if(checkHash()){
   showMsg('','');$('msg').className='msg';$('msg').style.display='block';
-  if(/jd\.com/.test(document.referrer||'')){
-    $('msg').innerHTML='✅ 书签已提取到 CK（来自京东页面），正在自动提交青龙…';
+  if(cameFromJd){
+    $('msg').innerHTML='✅ 油猴脚本已提取到 CK（来自京东页面），正在自动提交青龙…';
     doPush(true);
   }else{
     $('msg').innerHTML='已自动填入 CK，请点下方「一键提交到青龙」';

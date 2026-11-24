@@ -11,8 +11,10 @@
 ## 功能
 
 - **① 扫码登录**：页面直接显示京东官方登录二维码，京东 App 扫一扫 + 确认，自动提取校验并提交（适合身边有两台设备时）
-- **② 短信验证码一键提取（单手机推荐）**：手机浏览器在 `m.jd.com` 用短信验证码登录（真实页面，滑块验证正常过），登录后点一下预置的「提取CK」书签，自动跳回本工具并提交，**全程零复制粘贴、零截图**
+- **② 短信验证码 + 油猴脚本一键提取（单手机推荐）**：手机浏览器在 `m.jd.com` 用短信验证码登录（真实页面，滑块验证正常过），登录后点页面上的红色悬浮按钮「提取CK→青龙」，自动跳回本工具并提交，**全程零复制粘贴、零截图**
 - **③ 手动粘贴**：整段 Cookie 直接贴进来，自动只保留 `pt_key` / `pt_pin`（备用）
+
+> **注意**：原「一键提取书签」方案已废弃——京东把 `pt_key` 设为 HttpOnly，普通 `javascript:` 书签读不到，所以书签必然失效。改用油猴脚本（`GM_cookie` 有权限读 HttpOnly）才能真正实现一键提取。
 - **多账号安全**：检测到多个账号的 Cookie 混在一起会拒绝提交（防止误覆盖）；每次提交后自动核对并报告面板账号总数
 - **提交前校验**：调用京东 `me-api` 接口验证，失效 CK 不会被写进青龙
 - **自动增改**：按 `pt_pin` 判断账号，已存在则覆盖更新并确保启用，不存在则新增
@@ -20,16 +22,20 @@
 - **登录保护（页面可设置/修改）**：用户名 + 密码登录，可在页面「安全设置」里首次设置、随时改用户名/改密码、或关闭；凭据以 PBKDF2 加盐哈希存于 `data/auth.json`，不落明文
 - **零依赖**：仅 Python 标准库，镜像约 50MB
 
-## 「提取CK」书签怎么配（一次性，30 秒）
+## 「油猴脚本」怎么装（一次性，1 分钟）
 
-1. 打开本工具页面，点「复制书签代码」（代码里已自动带上你 R2S 的地址）
-2. iOS Safari：随便收藏任意页面 → 编辑该书签 → 清空网址栏 → 粘贴刚复制的代码，名称改成「提取CK」
-   Alook / 安卓浏览器：添加书签时直接把这段代码当地址填入
-3. 以后每次：`m.jd.com` 短信登录 → 点「提取CK」书签 → 自动回本页提交，完成
+1. 手机浏览器安装 **Tampermonkey（油猴）** 插件：
+   - 安卓：Kiwi 浏览器 / Firefox 装 Tampermonkey 扩展
+   - iPhone：Safari 装「Userscripts」或直接装 Tampermonkey App（App Store 可能收费，可选）
+2. 打开本工具页面，点「**安装油猴脚本**」，在弹出的页面点确认安装
+   （脚本会自动带上你当前访问的地址，外网穿透也适用）
+3. 以后每次：`m.jd.com` 短信登录 → 点页面右下角红色悬浮按钮「**提取CK→青龙**」→ 自动回本页提交，完成
+
+> iPhone 若无法装油猴，请用「③ 手动粘贴」或「④ Alook / 抓包」方式，效果一样。
 
 ## 多账号怎么加
 
-- **短信/书签方式**：在 `m.jd.com` 退出当前账号、登录另一个账号，再点一次「提取CK」书签即可（可无限重复）
+- **短信/油猴方式**：在 `m.jd.com` 退出当前账号、登录另一个账号，再点一次悬浮按钮即可（可无限重复）
 - **扫码方式**：京东 App 切换账号（或换家人手机）后重新扫码
 - **粘贴方式**：每次只粘贴一个账号；多个账号混贴会被拒绝
 - 每次提交成功后会显示「核对：面板现有 N 个账号（xxx、yyy）」，数字不对立即可见
@@ -39,7 +45,7 @@
 ```bash
 ssh root@192.168.1.1          # 登录 R2S
 cd /root
-git clone https://github.com/Wangzhe997/jd-ck-helper.git
+git clone https://github.com/Wangzhe997/jd-ck-helper.git   # 国内慢/超时？看下方「GitHub 加速」
 cd jd-ck-helper
 sh deploy.sh                  # 交互式填写青龙凭据，自动构建启动
 ```
@@ -48,9 +54,15 @@ sh deploy.sh                  # 交互式填写青龙凭据，自动构建启动
 
 > `deploy.sh` 会检查 docker、生成 `.env`、提示输入青龙 Client ID / Secret，然后 `docker compose up -d --build` 并打印访问地址。更新代码只要 `git pull && docker compose up -d --build`。
 >
-> 国内网络 `git clone` 慢或失败时，可改用压缩包（无需 git 环境）：
+> **GitHub 加速（国内 clone 慢或超时时用）**：把加速前缀直接拼在原链接前面即可：
 > ```bash
-> curl -L https://codeload.github.com/Wangzhe997/jd-ck-helper/tar.gz/refs/heads/main -o jd-ck-helper.tgz
+> git clone https://ghfast.top/https://github.com/Wangzhe997/jd-ck-helper.git
+> ```
+> 备选前缀（某个失效就换下一个）：`https://gh-proxy.com/` · `https://ghproxy.net/`
+>
+> 完全不想用 git 时，也可下载压缩包（无需 git 环境），同样走加速：
+> ```bash
+> curl -L https://ghfast.top/https://codeload.github.com/Wangzhe997/jd-ck-helper/tar.gz/refs/heads/main -o jd-ck-helper.tgz
 > tar -xzf jd-ck-helper.tgz && cd jd-ck-helper-main && sh deploy.sh
 > ```
 
